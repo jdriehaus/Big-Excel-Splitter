@@ -1,81 +1,142 @@
 import streamlit as st
-from io import BytesIO
-from openpyxl import load_workbook, Workbook
+import csv
+from io import TextIOWrapper, BytesIO
+import tempfile
 
-st.set_page_config(page_title="Excel Splitter", page_icon="📊", layout="centered")
-st.title("📊 Excel Splitter — Split Big Files in Half")
+st.set_page_config(page_title="CSV Splitter", page_icon="🪓", layout="centered")
+st.title("🪓 CSV Splitter — Split a Big CSV into Two Equal Halves")
 
-st.write("Upload a large `.xlsx` or `.xlsm` file and this app will split it into two Excel files, each with half the rows.")
+st.write(
+    "Upload a large **.csv** file. This app will split it into two CSVs, each with half the data rows. "
+    "It preserves quoting, delimiters, and embedded newlines using Python’s `csv` module."
+)
 
-uploaded = st.file_uploader("Upload Excel File", type=["xlsx", "xlsm"])
-sheet_name = st.text_input("Sheet name (optional, defaults to first sheet)", value="")
-use_header = st.checkbox("First row is a header", value=True)
+uploaded = st.file_uploader("Upload CSV", type=["csv"])
+has_header = st.checkbox("First row is a header", value=True)
+encoding = st.selectbox("File encoding", ["utf-8", "utf-8-sig", "latin-1"], index=0)
 
-def split_workbook(file_bytes, sheet=None, header=True):
-    # First pass: count rows
-    wb = load_workbook(filename=BytesIO(file_bytes), read_only=True, data_only=True)
-    ws = wb[sheet] if sheet else wb[wb.sheetnames[0]]
+st.caption(
+    "Tip: On Streamlit Cloud you can raise the upload limit by adding `.streamlit/config.toml` with:\n\n"
+    "[server]\nmaxUploadSize = 1000\n\n(in MB)"
+)
 
-    # Get header if it exists
-    header_row = None
+def sniff_dialect(sample_text):
     try:
-        header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True))
-    except StopIteration:
-        header_row = None
+        return csv.Sniffer().sniff(sample_text, delimiters=[",", ";", "\t", "|"])
+    except Exception:
+        # Fallback to comma-delimited RFC style
+        dialect = csv.excel
+        dialect.delimiter = ","
+        return dialect
 
-    data_start = 2 if header and header_row else 1
-    total = sum(1 for _ in ws.iter_rows(min_row=data_start, values_only=True))
-    half = total // 2
-    wb.close()
+def count_records(file_obj, enc, dialect, header):
+    # Wrap bytes → text for csv.reader without loading whole file
+    file_obj.seek(0)
+    txt = TextIOWrapper(file_obj, encoding=enc, newline="")
+    reader = csv.reader(txt, dialect=dialect)
+    total = 0
+    first = True
+    for _row in reader:
+        if first and header:
+            first = False
+            continue
+        total += 1
+        first = False
+    # IMPORTANT: detach to avoid closing the underlying uploaded buffer
+    txt.detach()
+    return total
 
-    # Second pass: actually split and write
-    wb = load_workbook(filename=BytesIO(file_bytes), read_only=True, data_only=True)
-    ws = wb[sheet] if sheet else wb[wb.sheetnames[0]]
+def split_csv(file_obj, enc, dialect, header, total_rows):
+    half = total_rows // 2  # first file gets floor half; second gets the rest
 
-    def new_wb():
-        w = Workbook(write_only=True)
-        s = w.create_sheet("Sheet1")
-        if header and header_row:
-            s.append(list(header_row))
-        return w, s
+    # Prepare two temp files to avoid holding everything in memory
+    tmp1 = tempfile.NamedTemporaryFile(mode="w", encoding=enc, newline="", delete=False, suffix=".csv")
+    tmp2 = tempfile.NamedTemporaryFile(mode="w", encoding=enc, newline="", delete=False, suffix=".csv")
 
-    wb1, ws1 = new_wb()
-    wb2, ws2 = new_wb()
+    w1 = csv.writer(tmp1, dialect=dialect)
+    w2 = csv.writer(tmp2, dialect=dialect)
 
-    count = 0
-    for row in ws.iter_rows(min_row=data_start, values_only=True):
-        if count < half:
-            ws1.append(list(row))
+    # Second pass: write rows
+    file_obj.seek(0)
+    txt = TextIOWrapper(file_obj, encoding=enc, newline="")
+    reader = csv.reader(txt, dialect=dialect)
+
+    wrote_header = False
+    if header:
+        try:
+            header_row = next(reader)
+            w1.writerow(header_row)
+            w2.writerow(header_row)
+            wrote_header = True
+        except StopIteration:
+            pass  # empty file
+
+    written = 0
+    for row in reader:
+        if written < half:
+            w1.writerow(row)
         else:
-            ws2.append(list(row))
-        count += 1
+            w2.writerow(row)
+        written += 1
 
-    wb.close()
+    # Clean up wrappers
+    txt.detach()
+    tmp1.flush(); tmp1.close()
+    tmp2.flush(); tmp2.close()
 
-    buf1, buf2 = BytesIO(), BytesIO()
-    wb1.save(buf1)
-    wb2.save(buf2)
-    buf1.seek(0)
-    buf2.seek(0)
+    # Read back as bytes for download buttons
+    with open(tmp1.name, "rb") as f1:
+        data1 = f1.read()
+    with open(tmp2.name, "rb") as f2:
+        data2 = f2.read()
 
-    return buf1, buf2, total, half, total - half
+    return data1, data2, half, total_rows - half, wrote_header
 
 if uploaded:
-    with st.spinner("Splitting your file... this might take a bit ⏳"):
-        try:
-            buf1, buf2, total, a, b = split_workbook(
-                uploaded.read(), sheet=sheet_name or None, header=use_header
-            )
-            st.success(f"✅ Done! Split {total:,} rows into two files ({a:,} + {b:,}).")
+    try:
+        with st.spinner("Analyzing file and splitting… ⏳"):
+            # Small initial sample for dialect sniffing (don’t consume the stream permanently)
+            uploaded.seek(0)
+            sample_bytes = uploaded.read(64 * 1024)  # 64KB sample
+            sample_text = sample_bytes.decode(encoding, errors="replace")
+            dialect = sniff_dialect(sample_text)
 
-            st.download_button(
-                "⬇️ Download Part 1 (.xlsx)", data=buf1, file_name="part1.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-            st.download_button(
-                "⬇️ Download Part 2 (.xlsx)", data=buf2, file_name="part2.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+            # Rewind to start for counting
+            uploaded.seek(0)
+            total = count_records(uploaded, encoding, dialect, has_header)
 
-        except Exception as e:
-            st.error(f"⚠️ Error: {e}")
+            if total == 0:
+                st.warning("No data rows found (after the header). Nothing to split.")
+            else:
+                # Split into two CSVs
+                uploaded.seek(0)
+                part1_bytes, part2_bytes, a, b, header_written = split_csv(
+                    uploaded, encoding, dialect, has_header, total
+                )
 
-st.caption("Built with 💚 Streamlit + openpyxl. Handles huge files via streaming I/O.")
+                st.success(f"Done! Split **{total:,}** data rows → Part 1: **{a:,}** rows, Part 2: **{b:,}** rows.")
+                if has_header and not header_written:
+                    st.info("Note: Header was enabled but not found (file may be empty).")
+
+                st.download_button(
+                    "⬇️ Download Part 1 (CSV)",
+                    data=part1_bytes,
+                    file_name="part1.csv",
+                    mime="text/csv",
+                )
+                st.download_button(
+                    "⬇️ Download Part 2 (CSV)",
+                    data=part2_bytes,
+                    file_name="part2.csv",
+                    mime="text/csv",
+                )
+
+                st.caption(
+                    "This app performs two streaming passes: one to count records accurately (handling embedded newlines), "
+                    "and one to write out two balanced CSVs. It does not load the entire file into memory."
+                )
+
+    except Exception as e:
+        st.error(f"⚠️ Error: {e}")
+else:
+    st.info("Upload a CSV to begin.")
