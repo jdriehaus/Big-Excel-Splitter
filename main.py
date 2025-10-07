@@ -1,4 +1,3 @@
-pip install streamlit openpyxl
 import streamlit as st
 from io import BytesIO
 from openpyxl import load_workbook, Workbook
